@@ -1,16 +1,49 @@
 import math
+import argparse
+import os
+import sys
+
+
+def _validate_geometry(d_out, w, s, n=None, thickness=None):
+    """Validate antenna geometry parameters."""
+    if d_out <= 0:
+        raise ValueError("d_out must be positive")
+    if w <= 0:
+        raise ValueError("track width w must be positive")
+    if s <= 0:
+        raise ValueError("track spacing s must be positive")
+    if n is not None and n < 1:
+        raise ValueError("number of turns n must be >= 1")
+    if thickness is not None and thickness <= 0:
+        raise ValueError("copper thickness must be positive")
+    if n is not None and d_out - 2 * n * (w + s) <= 0:
+        raise ValueError(
+            "geometry invalid: inner diameter is zero or negative "
+            "with given d_out, w, s, n"
+        )
+
 
 def calculate_inductance(d_out, w, s, n):
+    """Calculate inductance of a planar circular spiral inductor (µH).
+
+    Returns 0.0 if the inner diameter becomes zero or negative.
+    """
+    _validate_geometry(d_out, w, s)
     mu0 = 4 * math.pi * 10**-7
     d_in = d_out - 2 * n * (w + s)
-    if d_in <= 0: return 0.0
+    if d_in <= 0:
+        return 0.0
     d_avg = (d_out + d_in) / 2.0
     rho = (d_out - d_in) / (d_out + d_in)
+    # Mohan et al. (1999), Table I – circular spiral
     c1, c2, c3, c4 = 1.00, 2.46, 0.00, 0.20
     L = 0.5 * mu0 * (n**2) * d_avg * c1 * (math.log(c2 / rho) + c3 * rho + c4 * rho**2)
     return L * 1e6
 
+
 def calculate_resistance(d_out, w, s, n, thickness):
+    """Calculate DC resistance of the spiral trace (Ohm)."""
+    _validate_geometry(d_out, w, s, n=n, thickness=thickness)
     d_in = d_out - 2 * n * (w + s)
     d_avg = (d_out + d_in) / 2.0
     length = n * math.pi * d_avg
@@ -18,26 +51,54 @@ def calculate_resistance(d_out, w, s, n, thickness):
     cross_section_area = w * thickness
     return rho_cu * (length / cross_section_area)
 
+
 def find_best_integer_turns(target_L, d_out, w, s):
-    n = 1.0
-    step = 0.01
-    while True:
-        L = calculate_inductance(d_out, w, s, n)
-        if L >= target_L or L == 0: break
-        n += step
-    
-    n_floor = math.floor(n)
-    n_ceil = math.ceil(n)
-    
+    """Find the integer turn count whose inductance is closest to target_L (µH).
+
+    Uses binary search over the continuous turn range, then picks the
+    nearest integer (floor or ceil) by comparing inductance error.
+    """
+    _validate_geometry(d_out, w, s)
+    if target_L <= 0:
+        raise ValueError("target inductance must be positive")
+
+    # Upper bound: n where d_in reaches zero
+    n_max = d_out / (2 * (w + s)) - 1e-9
+
+    # Binary search for continuous n* where L(n*) ≈ target_L
+    lo, hi = 1.0, n_max
+
+    if calculate_inductance(d_out, w, s, 1.0) >= target_L:
+        n_star = 1.0
+    elif calculate_inductance(d_out, w, s, n_max) <= target_L:
+        # Target unreachable – use maximum feasible n
+        n_star = n_max
+    else:
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            if calculate_inductance(d_out, w, s, mid) < target_L:
+                lo = mid
+            else:
+                hi = mid
+            if abs(hi - lo) < 1e-9:
+                break
+        n_star = (lo + hi) / 2.0
+
+    n_floor = max(1, math.floor(n_star))
+    n_ceil = math.ceil(n_star)
+
     L_floor = calculate_inductance(d_out, w, s, n_floor)
     L_ceil = calculate_inductance(d_out, w, s, n_ceil)
-    
-    if abs(target_L - L_floor) < abs(target_L - L_ceil):
+
+    if L_ceil == 0 or abs(target_L - L_floor) < abs(target_L - L_ceil):
         return n_floor, L_floor
     else:
         return n_ceil, L_ceil
 
+
 def generate_kicad_footprint(filename, d_out_mm, w_mm, s_mm, n):
+    """Generate a KiCad footprint (.kicad_mod) with an Archimedean spiral."""
+    _validate_geometry(d_out_mm, w_mm, s_mm, n=n)
     r_out = (d_out_mm - w_mm) / 2.0
     pitch = w_mm + s_mm
     b = pitch / (2 * math.pi)
@@ -147,17 +208,65 @@ POPULATION RECOMMENDATION FOR YOUR BOARD:
         f.write(ascii_art)
     print(f"✅ Tuning data saved to: {filename}")
 
-# --- Your parameters ---
-TARGET_L_UH = 4.83
-D_OUT_MM = 50.0
-W_MM = 0.3
-S_MM = 0.3
-T_UM = 35.0
 
-d_out_m, w_m, s_m, t_m = D_OUT_MM/1000.0, W_MM/1000.0, S_MM/1000.0, T_UM/1e6
+def parse_args():
+    """Parse command-line arguments with sensible defaults."""
+    parser = argparse.ArgumentParser(
+        description="NFC PCB Antenna Generator for KiCad (ST25DV64KC)"
+    )
+    parser.add_argument(
+        "--target-l", type=float, default=4.83,
+        help="Target inductance in µH (default: 4.83)"
+    )
+    parser.add_argument(
+        "--d-out", type=float, default=50.0,
+        help="Outer diameter in mm (default: 50.0)"
+    )
+    parser.add_argument(
+        "--width", type=float, default=0.3,
+        help="Track width in mm (default: 0.3)"
+    )
+    parser.add_argument(
+        "--spacing", type=float, default=0.3,
+        help="Track spacing in mm (default: 0.3)"
+    )
+    parser.add_argument(
+        "--thickness", type=float, default=35.0,
+        help="Copper thickness in µm (default: 35.0)"
+    )
+    parser.add_argument(
+        "--out-dir", type=str, default=".",
+        help="Output directory for generated files (default: .)"
+    )
+    return parser.parse_args()
 
-turns, actual_l = find_best_integer_turns(TARGET_L_UH, d_out_m, w_m, s_m)
-r_dc = calculate_resistance(d_out_m, w_m, s_m, turns, t_m)
 
-generate_kicad_footprint(f"NFC_Tag_Antenna_{D_OUT_MM}mm_Integer.kicad_mod", D_OUT_MM, W_MM, S_MM, turns)
-generate_custom_schematic_file("ST25DV_Custom_Matching.txt", actual_l, r_dc)
+def main():
+    args = parse_args()
+
+    d_out_m = args.d_out / 1000.0
+    w_m = args.width / 1000.0
+    s_m = args.spacing / 1000.0
+    t_m = args.thickness / 1e6
+
+    try:
+        turns, actual_l = find_best_integer_turns(args.target_l, d_out_m, w_m, s_m)
+        r_dc = calculate_resistance(d_out_m, w_m, s_m, turns, t_m)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    kicad_path = os.path.join(
+        args.out_dir,
+        f"NFC_Tag_Antenna_{args.d_out}mm_Integer.kicad_mod",
+    )
+    schematic_path = os.path.join(args.out_dir, "ST25DV_Custom_Matching.txt")
+
+    generate_kicad_footprint(kicad_path, args.d_out, args.width, args.spacing, turns)
+    generate_custom_schematic_file(schematic_path, actual_l, r_dc)
+
+
+if __name__ == "__main__":
+    main()
